@@ -1,126 +1,160 @@
 # ============================================
-# Proyecto:  AuraBot
-# Archivo:   dispositivos.py (HAL)
-# Objetivo:  Abstracción de hardware para sensores y actuadores
-# Equipo:    Sandoval Cuevas Pedro, Taboada Ramírez Salvador,
-#            Barroso Garcia Braulio Axel
+# Proyecto:   AuraBot
+# Archivo:    dispositivos.py (HAL)
+# Objetivo:   Control de sensores y actuadores (3 Servos, OLED, Relevador, DFPlayer)
+# Equipo:     Sandoval Cuevas Pedro, Taboada Ramírez Salvador,
+#             Barroso Garcia Braulio Axel
 # Matrículas: 23240325, 23240999, 23240327
-# Materia:   Sistemas Programables — ISC TecNM León
-# Semestre:  ago-dic-2026
+# Materia:    Sistemas Programables — ISC TecNM León
+# Semestre:   ago-dic-2026
 # ============================================
 
-from machine import Pin, PWM, ADC, I2C, time_pulse_us
+from machine import Pin, PWM, ADC, I2C, UART, time_pulse_us
 import time
-import ssd1306
 
-class GestorSensores:
-    def __init__(self):
-        # PIR en GPIO 13
-        self.pir = Pin(13, Pin.IN)
-        # HC-SR04 en GPIO 26 (Trig) y 25 (Echo)
-        self.trig = Pin(26, Pin.OUT)
-        self.echo = Pin(25, Pin.IN)
-        # LDR en GPIO 34
-        self.ldr = ADC(Pin(34))
-        self.ldr.atten(ADC.ATTN_11DB) # Rango 0-3.3V
-        
-        # Historial para promedio móvil (últimas 5 lecturas)
-        self.historial_distancia = [0] * 5
-        self.historial_luz = [0] * 5
-        self.indice = 0
+try:
+    import ssd1306
+    TIENE_OLED = True
+except ImportError:
+    TIENE_OLED = False
+    print("Aviso: Librería ssd1306 no encontrada.")
 
-    def medir_distancia(self):
-        self.trig.value(0)
-        time.sleep_us(2)
-        self.trig.value(1)
-        time.sleep_us(10)
-        self.trig.value(0)
-        duracion = time_pulse_us(self.echo, 1, 30000)
-        if duracion > 0:
-            return (duracion * 0.0343) / 2
+# --- SENSORES ---
+pir = Pin(13, Pin.IN)
+trig = Pin(25, Pin.OUT)
+echo = Pin(26, Pin.IN)
+
+ldr = ADC(Pin(34))
+ldr.atten(ADC.ATTN_11DB)  # Lectura completa de 0 a 3.3V
+
+# --- ACTUADORES ---
+relevador = Pin(23, Pin.OUT)
+relevador.value(0)
+
+# Servomotores (50Hz estándar SG90)
+servo_cabeza = PWM(Pin(18), freq=50)
+servo_brazo_izq = PWM(Pin(19), freq=50)
+servo_brazo_der = PWM(Pin(27), freq=50)
+
+# Pantalla OLED I2C
+oled = None
+if TIENE_OLED:
+    try:
+        i2c = I2C(0, scl=Pin(22), sda=Pin(21))
+        oled = ssd1306.SSD1306_I2C(128, 64, i2c)
+    except Exception as e:
+        print("Error iniciando OLED:", e)
+
+# DFPlayer Mini (UART 2)
+dfplayer = UART(2, baudrate=9600, tx=17, rx=16)
+
+
+# ============================================
+# FUNCIONES DE LECTURA (SENSORES)
+# ============================================
+
+def leer_pir():
+    return pir.value()
+
+def leer_distancia():
+    trig.value(0)
+    time.sleep_us(2)
+    trig.value(1)
+    time.sleep_us(10)
+    trig.value(0)
+    
+    duracion = time_pulse_us(echo, 1, 30000)
+    if duracion < 0:
         return -1
+    distancia = (duracion * 0.0343) / 2
+    return round(distancia, 1)
 
-    def actualizar_promedios(self):
-        dist_actual = self.medir_distancia()
-        luz_actual = self.ldr.read()
-        
-        if dist_actual > 0:
-            self.historial_distancia[self.indice] = dist_actual
-        self.historial_luz[self.indice] = luz_actual
-        
-        self.indice = (self.indice + 1) % 5
+def leer_luz():
+    valor_crudo = ldr.read()  # 0 a 4095
+    porcentaje = int((valor_crudo / 4095) * 100)
+    return porcentaje
 
-    def obtener_resumen_sensores(self):
-        """Lee hardware, calcula promedios y devuelve valores interpretados."""
-        self.actualizar_promedios()
-        distancia_promedio = sum(self.historial_distancia) / 5
-        # Convertir ADC (0-4095) a porcentaje (0-100%)
-        luz_promedio = sum(self.historial_luz) / 5
-        luz_porcentaje = int((luz_promedio / 4095.0) * 100)
-        
-        return {
-            "pir": self.pir.value(), # 1 o 0
-            "distancia_cm": round(distancia_promedio, 1),
-            "luz_porcentaje": luz_porcentaje
-        }
 
-class GestorActuadores:
-    def __init__(self):
-        # Relevador en GPIO 23 (Activo en HIGH por defecto, cambiar si es LOW)
-        self.relevador = Pin(23, Pin.OUT)
-        self.relevador_activo_alto = False 
-        
-        # Servo en GPIO 18 (PWM a 50Hz)
-        self.servo = PWM(Pin(18), freq=50)
-        
-        # OLED en I2C (SDA 21, SCL 22)
-        try:
-            self.i2c = I2C(0, scl=Pin(22), sda=Pin(21))
-            self.oled = ssd1306.SSD1306_I2C(128, 64, self.i2c)
-            self.oled_disponible = True
-        except:
-            self.oled_disponible = False
-            
-        self.estado_seguro()
+# ============================================
+# FUNCIONES DE SERVOMOTORES (CABEZA Y BRAZOS)
+# ============================================
 
-    def controlar_relevador(self, estado):
-        """Recibe 'encender' o 'apagar'"""
-        if estado == "encender":
-            self.relevador.value(1 if self.relevador_activo_alto else 0)
-        else:
-            self.relevador.value(0 if self.relevador_activo_alto else 1)
+def mover_servo(servo, angulo):
+    if angulo < 0: angulo = 0
+    if angulo > 180: angulo = 180
+    duty = int((angulo / 180) * 102 + 26)
+    servo.duty(duty)
 
-    def controlar_servo(self, comando):
-        """Recibe 'saludar' o 'reposo' (rango 60 a 120 grados)"""
-        if comando == "saludar":
-            # Movimiento rápido de saludo simulado (60 a 120)
-            self.mover_servo(60)
-            time.sleep(0.3)
-            self.mover_servo(120)
-        else:
-            self.mover_servo(90) # Reposo al centro
+def reposo_servos():
+    """Centra cabeza y baja ambos brazos escalonadamente"""
+    mover_servo(servo_cabeza, 90)
+    time.sleep(0.15)
+    # Nota: Como los brazos van en lados opuestos, sus ángulos van invertidos
+    mover_servo(servo_brazo_izq, 20)
+    time.sleep(0.15)
+    mover_servo(servo_brazo_der, 160)
 
-    def mover_servo(self, grados):
-        min_ns = 500000
-        max_ns = 2400000
-        grados = max(60, min(120, grados)) # Limitar para no forzar cartón
-        ns = int(min_ns + (grados / 180) * (max_ns - min_ns))
-        self.servo.duty_ns(ns)
+def saludar_servos():
+    """Gira cabeza y levanta ambos brazos para saludar"""
+    mover_servo(servo_cabeza, 70)
+    time.sleep(0.15)
+    mover_servo(servo_brazo_izq, 130)
+    time.sleep(0.15)
+    mover_servo(servo_brazo_der, 50)
+    time.sleep(0.6)
+    
+    mover_servo(servo_cabeza, 110)
+    time.sleep(0.6)
+    reposo_servos()
 
-    def controlar_oled(self, expresion):
-        """Recibe 'feliz', 'neutral' o 'apagada'"""
-        if not self.oled_disponible: return
-        self.oled.fill(0)
-        if expresion == "feliz":
-            self.oled.text("^   ^", 40, 20)
-            self.oled.text("\\___/", 40, 40)
-        elif expresion == "neutral":
-            self.oled.text("-   -", 40, 20)
-            self.oled.text(" --- ", 40, 40)
-        self.oled.show()
+def respirar_servos():
+    """Movimiento lento de brazos y cabeza para guiar inhalación/exhalación"""
+    # Inhalar (suben brazos despacio)
+    for paso in range(0, 61, 5):
+        mover_servo(servo_brazo_izq, 20 + paso)
+        mover_servo(servo_brazo_der, 160 - paso)
+        time.sleep(0.08)
+    time.sleep(0.5)
+    # Exhalar (bajan brazos despacio)
+    for paso in range(60, -1, -5):
+        mover_servo(servo_brazo_izq, 20 + paso)
+        mover_servo(servo_brazo_der, 160 - paso)
+        time.sleep(0.08)
 
-    def estado_seguro(self):
-        """Apaga componentes y centra motores."""
-        self.controlar_relevador("apagar")
-        self.controlar_servo("reposo")
-        self.controlar_oled("neutral")
+
+# ============================================
+# FUNCIONES DE RELEVADOR, OLED Y AUDIO
+# ============================================
+
+def controlar_relevador(estado):
+    if estado == "encender":
+        relevador.value(1)
+    elif estado == "apagar":
+        relevador.value(0)
+
+def cambiar_oled(expresion):
+    if not oled:
+        return
+    oled.fill(0)
+    if expresion == "feliz":
+        oled.text("^   ^", 42, 20)
+        oled.text("\\___/", 42, 40)
+    elif expresion == "neutral":
+        oled.text("o   o", 42, 20)
+        oled.text(" --- ", 42, 40)
+    elif expresion == "apagada":
+        pass  # Deja la pantalla en negro
+    oled.show()
+
+def set_volumen_dfplayer(volumen=20):
+    if volumen > 30: volumen = 30
+    comando = bytearray([0x7E, 0xFF, 0x06, 0x06, 0x00, 0x00, volumen, 0xEF])
+    dfplayer.write(comando)
+
+def reproducir_pista_mp3(numero_pista):
+    comando = bytearray([0x7E, 0xFF, 0x06, 0x12, 0x00, 0x00, numero_pista, 0xEF])
+    dfplayer.write(comando)
+
+def detener_audio():
+    comando = bytearray([0x7E, 0xFF, 0x06, 0x16, 0x00, 0x00, 0x00, 0xEF])
+    dfplayer.write(comando)
