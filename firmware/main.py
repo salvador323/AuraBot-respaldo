@@ -1,78 +1,85 @@
 # ============================================
-# Proyecto:  AuraBot
-# Archivo:   main.py
-# Objetivo:  Bucle principal no bloqueante y nexo entre HAL y MQTT
-# Equipo:    Sandoval Cuevas Pedro, Taboada Ramírez Salvador,
-#            Barroso Garcia Braulio Axel
+# Proyecto:   AuraBot
+# Archivo:    main.py
+# Objetivo:   Bucle principal de telemetría y ejecución de comandos MQTT
+# Equipo:     Sandoval Cuevas Pedro, Taboada Ramírez Salvador,
+#             Barroso Garcia Braulio Axel
 # Matrículas: 23240325, 23240999, 23240327
-# Materia:   Sistemas Programables — ISC TecNM León
-# Semestre:  ago-dic-2026
+# Materia:    Sistemas Programables — ISC TecNM León
+# Semestre:   ago-dic-2026
 # ============================================
 
 import time
 import comunicacion
-from hal.dispositivos import GestorSensores, GestorActuadores
+from hal import dispositivos as disp
 
-# Inicializar HAL
-sensores = GestorSensores()
-actuadores = GestorActuadores()
-cliente_mqtt = None
+def al_recibir_mensaje(topico, mensaje):
+    topico_str = topico.decode("utf-8")
+    msg_str = mensaje.decode("utf-8").strip().lower()
+    print(f"MQTT [{topico_str}] -> {msg_str}")
 
-def procesar_comando(topic, msg):
-    """Callback que ejecuta comandos en los actuadores y reporta el estado."""
-    topic = topic.decode('utf-8')
-    msg = msg.decode('utf-8')
+    # Comandos para los 3 Servomotores (Cabeza + 2 Brazos)
+    if topico_str == "aurabot/comando/servo/central":
+        if msg_str == "saludar":
+            disp.saludar_servos()
+        elif msg_str == "respirar":
+            disp.respirar_servos()
+        elif msg_str == "reposo":
+            disp.reposo_servos()
+
+    # Comandos para Relevador (Luz ambiental)
+    elif topico_str == "aurabot/comando/relevador/central":
+        disp.controlar_relevador(msg_str)
+
+    # Comandos para Pantalla OLED
+    elif topico_str == "aurabot/comando/oled/central":
+        disp.cambiar_oled(msg_str)
+
+    # Comandos para DFPlayer Mini (Bocina)
+    elif topico_str == "aurabot/comando/audio/central":
+        if msg_str == "stop":
+            disp.detener_audio()
+        elif msg_str.isdigit():
+            disp.reproducir_pista_mp3(int(msg_str))
+
+# ============================================
+# INICIALIZACIÓN DEL SISTEMA
+# ============================================
+
+print("Iniciando AuraBot...")
+disp.reposo_servos()
+disp.cambiar_oled("neutral")
+time.sleep(1)
+disp.set_volumen_dfplayer(20)
+
+if comunicacion.conectar_wifi():
+    cliente = comunicacion.iniciar_mqtt(al_recibir_mensaje)
     
-    if topic == "aurabot/comando/servo/central":
-        actuadores.controlar_servo(msg)
-        cliente_mqtt.publish(b"aurabot/actuador/servo/central", msg)
+    if cliente:
+        # Suscripción adicional para el audio sin alterar comunicacion.py
+        cliente.subscribe(b"aurabot/comando/audio/central")
         
-    elif topic == "aurabot/comando/relevador/central":
-        actuadores.controlar_relevador(msg)
-        cliente_mqtt.publish(b"aurabot/actuador/relevador/central", msg)
+        ultimo_envio = time.ticks_ms()
         
-    elif topic == "aurabot/comando/oled/central":
-        actuadores.controlar_oled(msg)
-        cliente_mqtt.publish(b"aurabot/actuador/oled/central", msg)
-
-def publicar_telemetria(datos):
-    """Envía lecturas al broker."""
-    if cliente_mqtt:
-        cliente_mqtt.publish(b"aurabot/sensor/pir/central", str(datos["pir"]))
-        cliente_mqtt.publish(b"aurabot/sensor/ultrasonico/central", str(datos["distancia_cm"]))
-        cliente_mqtt.publish(b"aurabot/sensor/luz/central", str(datos["luz_porcentaje"]))
-
-def main():
-    global cliente_mqtt
-    if not comunicacion.conectar_wifi():
-        return
-
-    cliente_mqtt = comunicacion.iniciar_mqtt(procesar_comando)
-    
-    ultima_lectura = time.ticks_ms()
-    
-    while True:
-        try:
-            # Mantener conexión y escuchar comandos (no bloqueante)
-            if cliente_mqtt:
-                cliente_mqtt.check_msg()
-            
-            # Publicar sensores cada 2 segundos
-            ahora = time.ticks_ms()
-            if time.ticks_diff(ahora, ultima_lectura) >= 2000:
-                resumen = sensores.obtener_resumen_sensores()
-                print("Sensores:", resumen)
-                publicar_telemetria(resumen)
-                ultima_lectura = ahora
+        while True:
+            try:
+                # Revisa si llegaron órdenes desde Python o MQTT Explorer
+                cliente.check_msg()
                 
-            # No dormir más de 0.1s para no bloquear la llegada de comandos
-            time.sleep(0.05)
-            
-        except OSError:
-            # En caso de desconexión MQTT
-            print("Pérdida de conexión. Intentando reconectar...")
-            time.sleep(5)
-            cliente_mqtt = comunicacion.iniciar_mqtt(procesar_comando)
-
-if __name__ == "__main__":
-    main()
+                # Publica sensores cada 3 segundos
+                if time.ticks_diff(time.ticks_ms(), ultimo_envio) > 3000:
+                    pir_val = disp.leer_pir()
+                    dist_val = disp.leer_distancia()
+                    luz_val = disp.leer_luz()
+                    
+                    cliente.publish(b"aurabot/sensor/pir/central", str(pir_val).encode())
+                    cliente.publish(b"aurabot/sensor/ultrasonico/central", str(dist_val).encode())
+                    cliente.publish(b"aurabot/sensor/luz/central", str(luz_val).encode())
+                    
+                    ultimo_envio = time.ticks_ms()
+                    
+                time.sleep(0.05)
+                
+            except Exception as e:
+                print("Error en bucle principal:", e)
+                time.sleep(2)
