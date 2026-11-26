@@ -1,0 +1,5 @@
+WIFI_SSID = "LAGANN 2668"
+WIFI_CLAVE = "430[r09P"
+IP_BROKER = "192.168.137.1"  # O la IP que tenga tu compu hoy
+USUARIO_MQTT = "Pierd"
+CLAVE_MQTT = "P1t5"
