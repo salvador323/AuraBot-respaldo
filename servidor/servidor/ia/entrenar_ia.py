@@ -1,126 +1,156 @@
 import paho.mqtt.client as mqtt
 import cv2
 import numpy as np
-import sys
 import os
 import json
-import urllib.request
 
 IP_BROKER = "127.0.0.1"
 PUERTO = 1883
 TOPICO_CAMARA = "aurabot/sensor/camara/cam"
+TOPICO_COMANDO_ESCANEAR = "aurabot/comando/ia/escanear"
+MUESTRAS_OBJETIVO = 35
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-dataset_dir = os.path.join(script_dir, "dataset")
-ruta_xml = os.path.join(script_dir, "haarcascade_frontalface_default.xml")
-ruta_nombres = os.path.join(script_dir, "usuarios.json")
-url_xml = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+ruta_dataset = os.path.join(script_dir, "datos_validacion")
+ruta_modelos_dir = os.path.join(script_dir, "modelos")
+ruta_modelo = os.path.join(ruta_modelos_dir, "modelo_rostro.yml")
+ruta_nombres = os.path.join(ruta_modelos_dir, "usuarios.json")
 
-if not os.path.exists(ruta_xml) or os.path.getsize(ruta_xml) < 10000:
-    urllib.request.urlretrieve(url_xml, ruta_xml)
+os.makedirs(ruta_dataset, exist_ok=True)
+os.makedirs(ruta_modelos_dir, exist_ok=True)
 
-face_cascade = cv2.CascadeClassifier(ruta_xml)
+def cargar_detector_facial():
+    prototxt = os.path.join(ruta_modelos_dir, "deploy.prototxt")
+    caffemodel = None
+    for f in os.listdir(ruta_modelos_dir):
+        if f.startswith("res10_300x300") and f.endswith(".caffemodel"):
+            caffemodel = os.path.join(ruta_modelos_dir, f)
+            break
 
-print("\n=== REGISTRO DE USUARIOS EN AURABOT ===")
-user_id = input("ID numérico del usuario (ej: 1, 2, 3): ").strip()
-user_name = input("Nombre de la persona: ").strip()
+    if hasattr(cv2.dnn, "readNetFromCaffe") and os.path.exists(prototxt) and caffemodel:
+        try:
+            modelo = cv2.dnn.readNetFromCaffe(prototxt, caffemodel)
+            print("[✓] Detector facial DNN cargado desde 'ia/modelos/'.")
+            return ("dnn", modelo)
+        except Exception:
+            pass
 
-if not user_id.isdigit():
-    print("[!] El ID debe ser un número.")
-    sys.exit()
+    ruta_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    print("[✓] Detector facial Haar Cascade cargado.")
+    return ("haar", cv2.CascadeClassifier(ruta_xml))
 
-user_id = int(user_id)
+def detectar_rostros(detector, frame_bgr, grises):
+    tipo, modelo = detector
+    h, w = frame_bgr.shape[:2]
+    rostros = []
+    if tipo == "dnn":
+        blob = cv2.dnn.blobFromImage(cv2.resize(frame_bgr, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
+        modelo.setInput(blob)
+        detecciones = modelo.forward()
+        for i in range(detecciones.shape[2]):
+            if detecciones[0, 0, i, 2] > 0.6:
+                box = detecciones[0, 0, i, 3:7] * np.array([w, h, w, h])
+                (x1, y1, x2, y2) = box.astype("int")
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 > x1 and y2 > y1:
+                    rostros.append((x1, y1, x2 - x1, y2 - y1))
+    else:
+        rostros = modelo.detectMultiScale(grises, scaleFactor=1.1, minNeighbors=6, minSize=(30, 30))
+    return rostros
 
-usuarios = {"0": "Desconocido"}
+detector = cargar_detector_facial()
+
+id_usuario = input("Ingresa el ID numérico del usuario (ej. 1 para carpeta 01): ").strip()
+nombre_usuario = input("Ingresa el nombre del usuario (ej. Pedro): ").strip()
+
+usuarios = {}
 if os.path.exists(ruta_nombres):
-    with open(ruta_nombres, "r") as f:
+    with open(ruta_nombres, "r", encoding="utf-8") as f:
         usuarios = json.load(f)
 
-usuarios[str(user_id)] = user_name
-with open(ruta_nombres, "w") as f:
-    json.dump(usuarios, f, indent=4)
+usuarios[id_usuario] = {"nombre": nombre_usuario}
+with open(ruta_nombres, "w", encoding="utf-8") as f:
+    json.dump(usuarios, f, indent=4, ensure_ascii=False)
 
-user_folder = os.path.join(dataset_dir, f"user_{user_id}")
-os.makedirs(user_folder, exist_ok=True)
+muestras_capturadas = 0
+entrenamiento_listo = False
 
-muestras = 0
-TOTAL_MUESTRAS = 30
+def entrenar_modelo():
+    print("\n[*] Entrenando modelo LBPH con las muestras de 'datos_validacion/'...")
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    rostros = []
+    ids = []
+
+    for archivo in os.listdir(ruta_dataset):
+        if archivo.endswith(".jpg") and archivo.startswith("user."):
+            ruta_img = os.path.join(ruta_dataset, archivo)
+            img_gris = cv2.imread(ruta_img, cv2.IMREAD_GRAYSCALE)
+            id_img = int(archivo.split(".")[1])
+            rostros.append(img_gris)
+            ids.append(id_img)
+
+    recognizer.train(rostros, np.array(ids))
+    recognizer.save(ruta_modelo)
+    print(f"[✓] Modelo guardado en '{ruta_modelo}'. Total de muestras: {len(rostros)}")
+
+def al_conectar(cliente, userdata, flags, rc, properties=None):
+    print(f"[✓] Conectado a Mosquitto. Activando cámara para {MUESTRAS_OBJETIVO} muestras...")
+    cliente.subscribe(TOPICO_CAMARA)
+    cliente.publish(TOPICO_COMANDO_ESCANEAR, b"iniciar")
 
 def al_recibir_mensaje(cliente, userdata, msg):
-    global muestras
+    global muestras_capturadas, entrenamiento_listo
+
+    if msg.topic != TOPICO_CAMARA or entrenamiento_listo:
+        return
+
     try:
         nparr = np.frombuffer(msg.payload, np.uint8)
-        if len(nparr) == 38400:
-            frame16 = nparr.view(np.uint16).byteswap().reshape((120, 160))
-            b = (frame16 & 0x1F) << 3
-            g = ((frame16 >> 5) & 0x3F) << 2
-            r = ((frame16 >> 11) & 0x1F) << 3
-            frame = np.dstack((b, g, r)).astype(np.uint8)
-            frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_LINEAR)
-        else:
+        if len(nparr) != 38400:
             return
+
+        frame16 = nparr.view(np.uint16).byteswap().reshape((120, 160))
+        b = (frame16 & 0x1F) << 3
+        g = ((frame16 >> 5) & 0x3F) << 2
+        r = ((frame16 >> 11) & 0x1F) << 3
+        frame = np.dstack((b, g, r)).astype(np.uint8)
+        frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_LINEAR)
 
         grises = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         grises = cv2.equalizeHist(grises)
-        
-        rostros = face_cascade.detectMultiScale(grises, scaleFactor=1.1, minNeighbors=6, minSize=(30, 30))
-        
-        if len(rostros) > 0:
-            rostro_principal = max(rostros, key=lambda r: r[2] * r[3])
-            (x, y, w, h) = rostro_principal
-            
-            rostro_recortado = grises[y:y+h, x:x+w]
-            rostro_recortado = cv2.resize(rostro_recortado, (100, 100))
-            
-            # --- FILTRO CLAVE: Elimina reflejos de lentes y artefactos de luz ---
-            rostro_recortado = cv2.GaussianBlur(rostro_recortado, (3, 3), 0)
-            
-            muestras += 1
-            cv2.imwrite(os.path.join(user_folder, f"foto_{muestras}.jpg"), rostro_recortado)
-            
-            instruccion = f"Registrando '{user_name}': {muestras}/{TOTAL_MUESTRAS} (Mueve levemente la cabeza)"
-            print(f"[*] {instruccion}")
+
+        rostros = detectar_rostros(detector, frame, grises)
+
+        for (x, y, w, h) in rostros:
+            muestras_capturadas += 1
+            rostro_proc = cv2.GaussianBlur(grises[y:y+h, x:x+w], (3, 3), 0)
+            rostro_proc = cv2.resize(rostro_proc, (100, 100))
+
+            nombre_archivo = os.path.join(ruta_dataset, f"user.{id_usuario}.{muestras_capturadas}.jpg")
+            cv2.imwrite(nombre_archivo, rostro_proc)
+
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, f"{muestras}%", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        cv2.imshow("AuraBot - Registro Continuo", frame)
+            cv2.putText(frame, f"Muestra {muestras_capturadas}/{MUESTRAS_OBJETIVO}", (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            break
+
+        cv2.imshow("AuraBot - Entrenamiento Facial", frame)
         cv2.waitKey(1)
-        
-        if muestras >= TOTAL_MUESTRAS:
+
+        if muestras_capturadas >= MUESTRAS_OBJETIVO:
+            entrenamiento_listo = True
+            cliente.publish(TOPICO_COMANDO_ESCANEAR, b"detener")
             cv2.destroyAllWindows()
+            entrenar_modelo()
             cliente.disconnect()
-            entrenar_modelo_completo()
-            sys.exit()
-            
+
     except Exception as e:
-        print("[!] Error:", e)
+        print(f"[!] Error: {e}")
 
-def entrenar_modelo_completo():
-    print("\n[y] Entrenando modelo facial agnóstico a lentes...")
-    recognizer = cv2.face.LBPHFaceRecognizer_create(radius=1, neighbors=8, grid_x=8, grid_y=8)
-    
-    rostros_totales = []
-    etiquetas_totales = []
-    
-    for item in os.listdir(dataset_dir):
-        folder_path = os.path.join(dataset_dir, item)
-        if os.path.isdir(folder_path) and item.startswith("user_"):
-            id_actual = int(item.split("_")[1])
-            for filename in os.listdir(folder_path):
-                if filename.endswith(".jpg"):
-                    img_path = os.path.join(folder_path, filename)
-                    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-                    if img is not None:
-                        rostros_totales.append(img)
-                        etiquetas_totales.append(id_actual)
-                        
-    if len(rostros_totales) > 0:
-        recognizer.train(rostros_totales, np.array(etiquetas_totales))
-        recognizer.write(os.path.join(script_dir, "modelo_rostro.yml"))
-        print(f"[✓] Modelo actualizado. {len(rostros_totales)} muestras procesadas.")
-
-cliente = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-cliente.on_message = al_recibir_mensaje
-cliente.connect(IP_BROKER, PUERTO, 60)
-cliente.subscribe(TOPICO_CAMARA)
-cliente.loop_forever()
+if __name__ == "__main__":
+    cliente = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    cliente.on_connect = al_conectar
+    cliente.on_message = al_recibir_mensaje
+    cliente.connect(IP_BROKER, PUERTO, 60)
+    cliente.loop_forever()
